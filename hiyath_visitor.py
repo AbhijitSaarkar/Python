@@ -1,3 +1,18 @@
+import requests
+from bs4 import BeautifulSoup
+import random
+import json
+import time
+import logging
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from concurrent.futures import ThreadPoolExecutor
+import argparse
+import os
+
+# Import your existing HumanLikeVisitor class
 from selenium import webdriver
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.by import By
@@ -534,9 +549,8 @@ class HumanLikeVisitor:
         # Sometimes add some final scrolling if time permits
         if random.random() < 0.5:
             final_scroll_time = random.uniform(1.0, 3.0)
-            if time.time() - start_time + final_scroll_time <= total_duration:
-                logger.info("Adding final scroll before leaving")
-                self._brief_scrolling(driver, duration=final_scroll_time)
+            logger.info("Adding final scroll before leaving")
+            self._brief_scrolling(driver, duration=final_scroll_time)
     
     def visit_once(self):
         """
@@ -674,34 +688,647 @@ class HumanLikeVisitor:
         logger.info(f"Visits completed. Success: {self.successful_visits}, Failed: {self.failed_visits}")
 
 
-def main():
-    """Parse command line arguments and run the visitor."""
-    parser = argparse.ArgumentParser(description="Human-Like Hiyath Website Visitor")
+# New ProxyManager class to fetch and verify free proxies
+# Complete this ProxyManager class that was cut off in the original code
+class ProxyManager:
+    """Class to fetch, test, and manage free proxies."""
     
-    parser.add_argument("--count", type=int, default=1000, 
-                        help="Number of website visits (default: 1000)")
-    parser.add_argument("--headless", action="store_true", 
-                        help="Run in headless mode (invisible)")
-    parser.add_argument("--proxy-file", type=str, 
-                        help="Path to file containing proxies (one per line)")
-    parser.add_argument("--demo", action="store_true", 
-                        help="Run in demo mode with just 3 visits")
+    def __init__(self, cache_file="verified_proxies.json", max_proxies=100):
+        """
+        Initialize the proxy manager.
+        
+        Args:
+            cache_file: File to cache verified proxies
+            max_proxies: Maximum number of proxies to maintain
+        """
+        self.cache_file = cache_file
+        self.max_proxies = max_proxies
+        self.verified_proxies = []
+        self.used_proxies = set()
+        
+        # IP checking service URLs
+        self.ip_check_urls = [
+            "https://api.ipify.org",
+            "https://ifconfig.me/ip",
+            "https://icanhazip.com",
+            "https://ipinfo.io/json"
+        ]
+        
+        # Load cached proxies if available
+        self._load_cache()
+        logger.info(f"ProxyManager initialized with {len(self.verified_proxies)} cached proxies")
+    
+    def _load_cache(self):
+        """Load verified proxies from cache file if it exists."""
+        try:
+            if os.path.exists(self.cache_file):
+                with open(self.cache_file, 'r') as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        self.verified_proxies = data
+                        logger.info(f"Loaded {len(self.verified_proxies)} proxies from cache")
+        except Exception as e:
+            logger.error(f"Error loading proxy cache: {e}")
+            # Start with empty list if cache loading fails
+            self.verified_proxies = []
+    
+    def _save_cache(self):
+        """Save verified proxies to cache file."""
+        try:
+            with open(self.cache_file, 'w') as f:
+                json.dump(self.verified_proxies, f)
+            logger.info(f"Saved {len(self.verified_proxies)} proxies to cache")
+        except Exception as e:
+            logger.error(f"Error saving proxy cache: {e}")
+    
+    def fetch_free_proxies(self, min_proxies=10):
+        """
+        Fetch free proxies from various sources.
+        
+        Args:
+            min_proxies: Minimum number of proxies to collect
+        
+        Returns:
+            list: List of proxy strings in format "ip:port"
+        """
+        logger.info("Fetching free proxies from multiple sources")
+        proxies = set()
+        
+        # Try multiple free proxy sources
+        sources = [
+            self._fetch_proxies_from_free_proxy_list,
+            self._fetch_proxies_from_geonode,
+            self._fetch_proxies_from_proxyscrape
+        ]
+        
+        for source_func in sources:
+            try:
+                new_proxies = source_func()
+                proxies.update(new_proxies)
+                logger.info(f"Found {len(new_proxies)} proxies from source {source_func.__name__}")
+                
+                if len(proxies) >= min_proxies:
+                    break
+            except Exception as e:
+                logger.error(f"Error fetching from {source_func.__name__}: {e}")
+        
+        logger.info(f"Fetched total of {len(proxies)} unique proxies")
+        return list(proxies)
+    
+    def _fetch_proxies_from_free_proxy_list(self):
+        """Fetch proxies from free-proxy-list.net."""
+        proxies = []
+        try:
+            response = requests.get("https://free-proxy-list.net/", timeout=10)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            table = soup.find('table', {'id': 'proxylisttable'})
+            
+            if not table:
+                return proxies
+                
+            for row in table.tbody.find_all('tr'):
+                cells = row.find_all('td')
+                if len(cells) >= 2:
+                    ip = cells[0].text.strip()
+                    port = cells[1].text.strip()
+                    https = cells[6].text.strip()
+                    
+                    # Only use HTTPS proxies for secure connections
+                    if https.lower() == 'yes':
+                        proxy = f"{ip}:{port}"
+                        proxies.append(proxy)
+        except Exception as e:
+            logger.error(f"Error fetching from free-proxy-list: {e}")
+        
+        return proxies
+    
+    def _fetch_proxies_from_geonode(self):
+        """Fetch proxies from geonode.com."""
+        proxies = []
+        try:
+            url = "https://proxylist.geonode.com/api/proxy-list?limit=100&page=1&sort_by=lastChecked&sort_type=desc"
+            response = requests.get(url, timeout=10)
+            data = response.json()
+            
+            if 'data' in data:
+                for proxy_data in data['data']:
+                    ip = proxy_data.get('ip')
+                    port = proxy_data.get('port')
+                    if ip and port:
+                        proxy = f"{ip}:{port}"
+                        proxies.append(proxy)
+        except Exception as e:
+            logger.error(f"Error fetching from geonode: {e}")
+        
+        return proxies
+    
+    def _fetch_proxies_from_proxyscrape(self):
+        """Fetch proxies from proxyscrape.com."""
+        proxies = []
+        try:
+            url = "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all"
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                for line in response.text.splitlines():
+                    if ':' in line:
+                        proxies.append(line.strip())
+        except Exception as e:
+            logger.error(f"Error fetching from proxyscrape: {e}")
+        
+        return proxies
+    
+    def verify_proxy(self, proxy, timeout=5):
+        """
+        Verify if a proxy is working by checking IP.
+        
+        Args:
+            proxy: Proxy string (ip:port)
+            timeout: Request timeout in seconds
+        
+        Returns:
+            dict: Information about the proxy if working, None otherwise
+        """
+        logger.debug(f"Testing proxy: {proxy}")
+        proxy_dict = {
+            "http": f"http://{proxy}",
+            "https": f"http://{proxy}"  # Using http:// even for https connections
+        }
+        
+        # Try different IP check services
+        for url in self.ip_check_urls:
+            try:
+                start_time = time.time()
+                response = requests.get(
+                    url, 
+                    proxies=proxy_dict, 
+                    timeout=timeout,
+                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+                )
+                
+                if response.status_code == 200:
+                    elapsed = time.time() - start_time
+                    
+                    # Get IP address and geolocation
+                    if 'ipinfo.io' in url:
+                        data = response.json()
+                        ip = data.get('ip')
+                        country = data.get('country', 'Unknown')
+                        region = data.get('region', 'Unknown')
+                        city = data.get('city', 'Unknown')
+                        location = f"{city}, {region}, {country}"
+                    else:
+                        ip = response.text.strip()
+                        # Get geolocation for IP
+                        try:
+                            geo_response = requests.get(f"https://ipinfo.io/{ip}/json", timeout=timeout)
+                            if geo_response.status_code == 200:
+                                geo_data = geo_response.json()
+                                country = geo_data.get('country', 'Unknown')
+                                region = geo_data.get('region', 'Unknown')
+                                city = geo_data.get('city', 'Unknown')
+                                location = f"{city}, {region}, {country}"
+                            else:
+                                location = "Unknown"
+                        except:
+                            location = "Unknown"
+                    
+                    logger.debug(f"Proxy {proxy} is working. IP: {ip}, Location: {location}, Response time: {elapsed:.2f}s")
+                    return {
+                        "proxy": proxy,
+                        "ip": ip,
+                        "location": location,
+                        "response_time": elapsed
+                    }
+                
+            except Exception as e:
+                logger.debug(f"Proxy test failed for {proxy} with {url}: {str(e)}")
+        
+        logger.debug(f"Proxy {proxy} failed all verification tests")
+        return None
+    
+    def verify_proxies(self, proxy_list, max_workers=10):
+        """
+        Verify multiple proxies concurrently.
+        
+        Args:
+            proxy_list: List of proxies to verify
+            max_workers: Maximum number of concurrent workers
+        
+        Returns:
+            list: List of verified proxy information
+        """
+        logger.info(f"Verifying {len(proxy_list)} proxies with {max_workers} workers")
+        verified = []
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all verification tasks
+            future_to_proxy = {
+                executor.submit(self.verify_proxy, proxy): proxy 
+                for proxy in proxy_list
+            }
+            
+            # Process results as they complete
+            for future in future_to_proxy:
+                proxy_info = future.result()
+                if proxy_info:
+                    verified.append(proxy_info)
+                    
+                    # Report progress periodically
+                    if len(verified) % 5 == 0:
+                        logger.info(f"Verified {len(verified)} working proxies so far")
+        
+        logger.info(f"Completed verification. Found {len(verified)} working proxies")
+        return verified
+    
+    def update_proxy_list(self, min_proxies=20):
+        """
+        Update the list of verified proxies.
+        
+        Args:
+            min_proxies: Minimum number of proxies to maintain
+        """
+        # Skip update if we already have enough verified proxies
+        if len(self.verified_proxies) >= min_proxies:
+            logger.info(f"Already have {len(self.verified_proxies)} verified proxies, skipping update")
+            return
+            
+        logger.info(f"Updating proxy list to reach minimum of {min_proxies} proxies")
+        
+        # Fetch new proxies
+        new_proxies = self.fetch_free_proxies(min_proxies=min_proxies * 5)  # Fetch extra to account for failures
+        
+        # Filter out already verified or used proxies
+        existing_proxy_strings = set(p.get("proxy") for p in self.verified_proxies)
+        new_proxies = [p for p in new_proxies if p not in existing_proxy_strings and p not in self.used_proxies]
+        
+        if not new_proxies:
+            logger.warning("No new proxies found to verify")
+            return
+            
+        # Verify the new proxies
+        verified_proxies = self.verify_proxies(new_proxies)
+        
+        # Add new verified proxies to our list
+        self.verified_proxies.extend(verified_proxies)
+        
+        # Keep only the fastest proxies up to max_proxies
+        if len(self.verified_proxies) > self.max_proxies:
+            self.verified_proxies.sort(key=lambda x: x.get("response_time", 999))
+            self.verified_proxies = self.verified_proxies[:self.max_proxies]
+        
+        # Save updated proxy list
+        self._save_cache()
+        
+        logger.info(f"Proxy list updated. Now have {len(self.verified_proxies)} verified proxies")
+    
+    def get_proxy(self):
+        """
+        Get a working proxy from the list of verified proxies.
+        
+        Returns:
+            dict: Proxy information if available, None otherwise
+        """
+        # Make sure we have proxies available
+        if not self.verified_proxies:
+            logger.info("No verified proxies available. Fetching new proxies.")
+            self.update_proxy_list()
+            
+            if not self.verified_proxies:
+                logger.error("Failed to find any working proxies")
+                return None
+        
+        # Select a proxy from the verified list
+        if self.verified_proxies:
+            # Prioritize proxies not recently used
+            available_proxies = [p for p in self.verified_proxies if p.get("proxy") not in self.used_proxies]
+            
+            # If all have been used, reset tracking and use all
+            if not available_proxies:
+                logger.info("All proxies have been used. Resetting tracking.")
+                self.used_proxies.clear()
+                available_proxies = self.verified_proxies
+            
+            # Choose a proxy - prefer faster ones with some randomness
+            available_proxies.sort(key=lambda x: x.get("response_time", 999))
+            # Take from the fastest 75%
+            selection_pool = available_proxies[:max(1, int(len(available_proxies) * 0.75))]
+            proxy_info = random.choice(selection_pool)
+            
+            # Mark as used and return
+            proxy_string = proxy_info.get("proxy")
+            self.used_proxies.add(proxy_string)
+            
+            logger.info(f"Selected proxy: {proxy_string}, Location: {proxy_info.get('location')}")
+            return proxy_info
+        
+        return None
+
+
+# Extend the existing HumanLikeVisitor class with IP rotation capabilities
+class HumanLikeVisitorWithIPRotation(HumanLikeVisitor):
+    """Extended visitor class with IP rotation capabilities."""
+    
+    def __init__(self, headless=False, use_proxies=True, use_tor=False, proxy_manager=None):
+        """
+        Initialize the visitor with IP rotation settings.
+        
+        Args:
+            headless: Whether to run browser in headless mode
+            use_proxies: Whether to use free proxies
+            use_tor: Whether to use Tor network (not implemented yet)
+            proxy_manager: Optional existing proxy manager instance
+        """
+        super().__init__(headless=headless)
+        self.use_proxies = use_proxies
+        self.use_tor = use_tor
+        self.current_ip_info = None
+        self.original_ip = None
+        
+        # Initialize proxy manager if we're using proxies
+        if use_proxies:
+            self.proxy_manager = proxy_manager if proxy_manager else ProxyManager()
+        else:
+            self.proxy_manager = None
+            
+        # Check our original IP
+        self._check_original_ip()
+        
+    def _check_original_ip(self):
+        """Check and record our original IP address without proxies."""
+        try:
+            for url in ["https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"]:
+                try:
+                    response = requests.get(url, timeout=5)
+                    if response.status_code == 200:
+                        self.original_ip = response.text.strip()
+                        logger.info(f"Original IP address: {self.original_ip}")
+                        break
+                except:
+                    continue
+                    
+            if not self.original_ip:
+                logger.warning("Could not determine original IP address")
+                self.original_ip = "unknown"
+        except Exception as e:
+            logger.error(f"Error checking original IP: {e}")
+            self.original_ip = "unknown"
+            
+    def _verify_ip_changed(self, driver):
+        """
+        Verify that our IP address has changed in the browser.
+        
+        Args:
+            driver: Selenium WebDriver instance
+            
+        Returns:
+            bool: True if IP has changed, False otherwise
+        """
+        logger.info("Verifying IP address change...")
+        changed = False
+        
+        try:
+            # Try multiple IP check services
+            ip_check_urls = [
+                "https://api.ipify.org",
+                "https://ifconfig.me/ip",
+                "https://icanhazip.com"
+            ]
+            
+            for url in ip_check_urls:
+                try:
+                    driver.get(url)
+                    WebDriverWait(driver, 10).until(
+                        EC.presence_of_element_located((By.TAG_NAME, "body"))
+                    )
+                    
+                    # Get the IP from the page
+                    current_ip = driver.find_element(By.TAG_NAME, "body").text.strip()
+                    logger.info(f"Current browser IP: {current_ip}")
+                    
+                    # Check if IP is different from our original IP
+                    if current_ip and current_ip != self.original_ip:
+                        logger.info(f"IP change verified: {self.original_ip} -> {current_ip}")
+                        
+                        # Optionally get geolocation info
+                        try:
+                            driver.get("https://ipinfo.io/json")
+                            WebDriverWait(driver, 10).until(
+                                EC.presence_of_element_located((By.TAG_NAME, "pre"))
+                            )
+                            
+                            geo_data = json.loads(driver.find_element(By.TAG_NAME, "pre").text)
+                            location = f"{geo_data.get('city', 'Unknown')}, {geo_data.get('region', 'Unknown')}, {geo_data.get('country', 'Unknown')}"
+                            logger.info(f"Current location: {location}")
+                        except Exception as e:
+                            logger.warning(f"Could not get geolocation info: {e}")
+                            location = "Unknown"
+                            
+                        # Store current IP info
+                        self.current_ip_info = {
+                            "ip": current_ip,
+                            "location": location
+                        }
+                        
+                        changed = True
+                        break
+                except Exception as e:
+                    logger.warning(f"Error checking IP with {url}: {e}")
+                    continue
+            
+            if not changed:
+                logger.warning("IP address has NOT changed!")
+            
+            return changed
+                
+        except Exception as e:
+            logger.error(f"Error verifying IP change: {e}")
+            return False
+    
+    def _setup_tor_proxy(self):
+        """
+        Set up Tor as a proxy (placeholder - would need actual Tor setup logic).
+        
+        Returns:
+            str: Proxy string for Tor (e.g. "127.0.0.1:9050")
+        """
+        # This is a placeholder - in a real implementation you would:
+        # 1. Check if Tor is installed
+        # 2. Start the Tor service if needed
+        # 3. Configure Tor for your needs
+        # 4. Return the SOCKS proxy address
+        
+        logger.warning("Tor support not fully implemented - this is a placeholder")
+        return "127.0.0.1:9050"  # Default Tor SOCKS proxy address
+    
+    def _create_driver_with_rotation(self):
+        """
+        Create a driver with IP rotation enabled.
+        
+        Returns:
+            WebDriver: Configured Selenium WebDriver
+        """
+        proxy_string = None
+        
+        # Get proxy based on settings
+        if self.use_proxies:
+            logger.info("Setting up proxy rotation...")
+            proxy_info = self.proxy_manager.get_proxy()
+            
+            if proxy_info:
+                proxy_string = proxy_info.get("proxy")
+                logger.info(f"Using proxy: {proxy_string}, Location: {proxy_info.get('location')}")
+            else:
+                logger.warning("No working proxy found. Will use direct connection.")
+        
+        elif self.use_tor:
+            logger.info("Setting up Tor rotation...")
+            proxy_string = self._setup_tor_proxy()
+            logger.info(f"Using Tor proxy: {proxy_string}")
+            
+        # Update the proxy for this session
+        self.proxy = proxy_string
+        
+        # Create the driver using the parent method (which will use the updated proxy)
+        return self._create_driver()
+    
+    def visit_once(self):
+        """
+        Visit the website once with IP rotation.
+        
+        Returns:
+            bool: True if visit was successful, False otherwise
+        """
+        # Create driver with IP rotation
+        driver = self._create_driver_with_rotation()
+        start_time = time.time()
+        success = False
+        
+        try:
+            # Verify IP has changed
+            if not self._verify_ip_changed(driver):
+                logger.warning("IP address did not change. Aborting this visit.")
+                self.failed_visits += 1
+                return False
+            
+            # Visit the website
+            logger.info(f"Visiting {HIYATH_URL}")
+            driver.get(HIYATH_URL)
+            
+            # Wait for page to load
+            try:
+                WebDriverWait(driver, 20).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "body"))
+                )
+                logger.info("Page loaded successfully")
+            except TimeoutException:
+                logger.warning("Page load timed out, continuing anyway")
+            
+            # Run the human-like session for 30 seconds
+            self._simulate_user_session(driver, total_duration=30)
+            
+            # Success
+            self.successful_visits += 1
+            success = True
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error during website visit: {e}")
+            self.failed_visits += 1
+            return False
+            
+        finally:
+            # Calculate actual session time
+            session_time = time.time() - start_time
+            logger.info(f"Session completed in {session_time:.1f} seconds (success: {success})")
+            
+            # Always clean up
+            try:
+                driver.quit()
+                logger.debug("Browser closed")
+            except Exception as e:
+                logger.error(f"Error closing browser: {e}")
+
+
+# Main execution function
+def main():
+    """Main function to run the program."""
+    parser = argparse.ArgumentParser(description="Visit website with human-like behavior and IP rotation")
+    parser.add_argument("--count", type=int, default=1000, help="Number of visits to make")
+    parser.add_argument("--headless", action="store_true", help="Run in headless mode")
+    parser.add_argument("--proxy-file", type=str, help="Path to proxy list file")
+    parser.add_argument("--use-tor", action="store_true", help="Use Tor network for IP rotation")
+    parser.add_argument("--use-proxies", action="store_true", help="Use free proxies for IP rotation")
+    parser.add_argument("--min-proxies", type=int, default=20, help="Minimum number of proxies to maintain")
     
     args = parser.parse_args()
     
-    # Apply demo mode if selected
-    if args.demo:
-        args.count = 3
-        logger.info("Running in demo mode with just 3 visits")
+    # Set up logging to file and console
+    log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    root_logger = logging.getLogger()
     
-    # Create visitor - Default is visible mode (headless=False)
-    visitor = HumanLikeVisitor(headless=args.headless)
+    # File handler
+    file_handler = logging.FileHandler("website_visitor.log")
+    file_handler.setFormatter(log_formatter)
+    root_logger.addHandler(file_handler)
     
-    # Run with or without proxy file
-    if args.proxy_file:
-        visitor.run_with_proxy_file(count=args.count, proxy_file=args.proxy_file)
-    else:
-        visitor.run_visits(count=args.count)
+    logger.info("Starting website visitor with IP rotation")
+    
+    # Initialize proxy manager if using proxies
+    proxy_manager = None
+    if args.use_proxies or args.proxy_file:
+        proxy_manager = ProxyManager()
+        
+        # Update proxy list to ensure we have enough
+        if args.proxy_file:
+            # Load proxies from file
+            logger.info(f"Loading proxies from file: {args.proxy_file}")
+            proxies = []
+            try:
+                with open(args.proxy_file, 'r') as f:
+                    proxies = [line.strip() for line in f if line.strip()]
+                logger.info(f"Loaded {len(proxies)} proxies from file")
+                
+                # Verify these proxies
+                verified = proxy_manager.verify_proxies(proxies)
+                proxy_manager.verified_proxies = verified
+                proxy_manager._save_cache()
+            except Exception as e:
+                logger.error(f"Error loading proxy file: {e}")
+        else:
+            # Fetch and verify proxies
+            logger.info("Fetching and verifying proxies...")
+            proxy_manager.update_proxy_list(min_proxies=args.min_proxies)
+    
+    # Create visitor with IP rotation
+    visitor = HumanLikeVisitorWithIPRotation(
+        headless=args.headless,
+        use_proxies=args.use_proxies or args.proxy_file is not None,
+        use_tor=args.use_tor,
+        proxy_manager=proxy_manager
+    )
+    
+    # Run the visits
+    logger.info(f"Starting {args.count} visits with IP rotation")
+    
+    for i in range(args.count):
+        try:
+            current_time = time.strftime("%H:%M:%S")
+            logger.info(f"Visit {i+1}/{args.count} at {current_time}")
+            
+            success = visitor.visit_once()
+            
+            # Add a random delay between visits (3-10 seconds)
+            if i < args.count - 1:  # Skip delay after last visit
+                delay = random.uniform(3, 10)
+                logger.info(f"Waiting {delay:.2f} seconds before next visit")
+                time.sleep(delay)
+                
+        except Exception as e:
+            logger.error(f"Error in visit iteration {i+1}: {e}")
+            visitor.failed_visits += 1
+    
+    # Print stats
+    logger.info(f"All visits completed. Success: {visitor.successful_visits}, Failed: {visitor.failed_visits}")
 
 
 if __name__ == "__main__":
